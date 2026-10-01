@@ -13,9 +13,11 @@ import (
 
 	"github.com/Dani-Bhai/pg-vault/internal/backup"
 	"github.com/Dani-Bhai/pg-vault/internal/config"
+	"github.com/Dani-Bhai/pg-vault/internal/docker"
 	"github.com/Dani-Bhai/pg-vault/internal/encryption"
 	"github.com/Dani-Bhai/pg-vault/internal/metadata"
 	"github.com/Dani-Bhai/pg-vault/internal/postgres"
+	"github.com/Dani-Bhai/pg-vault/internal/sshtunnel"
 	"github.com/Dani-Bhai/pg-vault/internal/storage"
 )
 
@@ -42,7 +44,7 @@ func Open() (*App, error) {
 	return &App{
 		Config:  cfg,
 		Store:   store,
-		Manager: backup.NewManager(postgres.NewDumper(), store),
+		Manager: backup.NewManager(postgres.NewLocalDumper(), store),
 	}, nil
 }
 
@@ -101,17 +103,76 @@ func (a *App) RunBackup(
 		keyring = encryption.Keyring{keyVersion: a.Config.EncryptionKey}
 	}
 
+	// A tunnel profile routes the backup through an SSH bastion. A
+	// docker profile additionally switches pg_dump from this machine
+	// into the container: on the bastion when both profiles exist,
+	// locally otherwise.
+	tunnelSpec, err := a.Store.GetTunnel(database.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	containerSpec, err := a.Store.GetDocker(database.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	dumper := selectDumper(tunnelSpec, containerSpec)
+
+	databaseURL := database.ConnectionString
+	if containerSpec == nil && tunnelSpec != nil {
+		// pg_dump dials the local end of the tunnel instead of the
+		// database directly.
+		forward, tunneledURL, err := a.openTunnel(
+			ctx,
+			database.ConnectionString,
+			tunnelSpec,
+		)
+		if err != nil {
+			return nil, err
+		}
+		defer forward.Close()
+		databaseURL = tunneledURL
+	}
+
 	return a.Manager.Backup(ctx, backup.Request{
 		DatabaseID:     database.ID,
 		DatabaseName:   database.Name,
-		DatabaseURL:    database.ConnectionString,
+		DatabaseURL:    databaseURL,
 		Storage:        store,
 		StorageBackend: backend,
 		Encryption:     encryptBackups,
 		Keyring:        keyring,
 		KeyVersion:     keyVersion,
 		Trigger:        trigger,
+		Dumper:         dumper,
 	})
+}
+
+// selectDumper picks the dump strategy for a database. A tunnel
+// without a docker profile is handled by the caller with a local port
+// forward, so it keeps the local dumper.
+func selectDumper(
+	tunnel *metadata.Tunnel,
+	container *metadata.Docker,
+) postgres.Dumper {
+	if container == nil {
+		return postgres.NewLocalDumper()
+	}
+
+	dumper := &docker.Dumper{
+		Profile: docker.Profile{
+			Container: container.Container,
+			Host:      container.Host,
+			Port:      container.Port,
+		},
+	}
+	if tunnel != nil {
+		cfg := TunnelConfig(tunnel)
+		dumper.Host.Tunnel = &cfg
+	}
+
+	return dumper
 }
 
 // RecordSkipped records a scheduled backup that was not started
@@ -170,4 +231,56 @@ func (a *App) Storage(backend string) (storage.Storage, error) {
 		Prefix:    a.Config.S3.Prefix,
 		PathStyle: a.Config.S3.PathStyle,
 	})
+}
+
+// openTunnel starts an SSH forward for a connection string and returns
+// the tunnel together with the connection string rewritten to dial the
+// local end of the tunnel.
+func (a *App) openTunnel(
+	ctx context.Context,
+	connectionString string,
+	spec *metadata.Tunnel,
+) (*sshtunnel.Tunnel, string, error) {
+	endpoint, err := postgres.ParseEndpoint(connectionString)
+	if err != nil {
+		return nil, "", fmt.Errorf("ssh tunnel target: %w", err)
+	}
+
+	forward, err := sshtunnel.Open(
+		ctx,
+		TunnelConfig(spec),
+		endpoint.Host,
+		endpoint.Port,
+	)
+	if err != nil {
+		return nil, "", fmt.Errorf("open ssh tunnel to %s:%d: %w", spec.Host, spec.Port, err)
+	}
+
+	url, err := postgres.RewriteEndpoint(
+		connectionString,
+		forward.LocalAddr(),
+	)
+	if err != nil {
+		forward.Close()
+		return nil, "", err
+	}
+
+	return forward, url, nil
+}
+
+// TunnelConfig converts a stored tunnel profile into runtime
+// configuration; secrets left empty come from the environment at
+// resolve time (PGVAULT_SSH_PASSWORD, PGVAULT_SSH_KEY_PASSPHRASE).
+func TunnelConfig(spec *metadata.Tunnel) sshtunnel.Config {
+	return sshtunnel.Config{
+		Host:                  spec.Host,
+		Port:                  spec.Port,
+		User:                  spec.User,
+		Auth:                  spec.AuthMethod,
+		Password:              spec.Password,
+		KeyFile:               spec.KeyPath,
+		KeyPassphrase:         spec.KeyPassphrase,
+		KnownHosts:            spec.KnownHosts,
+		InsecureIgnoreHostKey: spec.Insecure,
+	}
 }

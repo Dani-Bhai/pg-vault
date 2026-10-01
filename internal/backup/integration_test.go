@@ -69,7 +69,7 @@ func TestEncryptedBackupRestores(t *testing.T) {
 	}
 
 	localStore := storage.NewLocalStorage(t.TempDir())
-	manager := backup.NewManager(postgres.NewDumper(), store)
+	manager := backup.NewManager(postgres.NewLocalDumper(), store)
 
 	result, err := manager.Backup(ctx, backup.Request{
 		DatabaseID:     database.ID,

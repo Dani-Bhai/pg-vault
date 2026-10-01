@@ -61,6 +61,60 @@ CREATE TABLE IF NOT EXISTS backups (
 
 CREATE INDEX IF NOT EXISTS backups_database_name_started_at
 	ON backups (database_name, started_at DESC);
+
+CREATE TABLE IF NOT EXISTS ssh_tunnels (
+	database_id    TEXT PRIMARY KEY REFERENCES databases (id) ON DELETE CASCADE,
+	host           TEXT NOT NULL,
+	port           INTEGER NOT NULL CHECK (port > 0 AND port < 65536),
+	user_name      TEXT NOT NULL DEFAULT '',
+	auth_method    TEXT NOT NULL DEFAULT 'auto'
+		CHECK (auth_method IN ('auto', 'password', 'key', 'agent')),
+	password       TEXT NOT NULL DEFAULT '',
+	key_path       TEXT NOT NULL DEFAULT '',
+	key_passphrase TEXT NOT NULL DEFAULT '',
+	known_hosts    TEXT NOT NULL DEFAULT '',
+	insecure       INTEGER NOT NULL DEFAULT 0,
+	created_at     TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS docker_containers (
+	database_id TEXT PRIMARY KEY REFERENCES databases (id) ON DELETE CASCADE,
+	container   TEXT NOT NULL,
+	host        TEXT NOT NULL DEFAULT '127.0.0.1',
+	port        INTEGER NOT NULL CHECK (port > 0 AND port < 65536),
+	created_at  TEXT NOT NULL
+);
+`
+
+// sshTunnelsMigration migrates a version 1 metadata database to
+// version 2 by adding SSH tunnel profiles.
+const sshTunnelsMigration = `
+CREATE TABLE IF NOT EXISTS ssh_tunnels (
+	database_id    TEXT PRIMARY KEY REFERENCES databases (id) ON DELETE CASCADE,
+	host           TEXT NOT NULL,
+	port           INTEGER NOT NULL CHECK (port > 0 AND port < 65536),
+	user_name      TEXT NOT NULL DEFAULT '',
+	auth_method    TEXT NOT NULL DEFAULT 'auto'
+		CHECK (auth_method IN ('auto', 'password', 'key', 'agent')),
+	password       TEXT NOT NULL DEFAULT '',
+	key_path       TEXT NOT NULL DEFAULT '',
+	key_passphrase TEXT NOT NULL DEFAULT '',
+	known_hosts    TEXT NOT NULL DEFAULT '',
+	insecure       INTEGER NOT NULL DEFAULT 0,
+	created_at     TEXT NOT NULL
+);
+`
+
+// dockerContainersMigration migrates a version 2 metadata database to
+// version 3 by adding docker container profiles.
+const dockerContainersMigration = `
+CREATE TABLE IF NOT EXISTS docker_containers (
+	database_id TEXT PRIMARY KEY REFERENCES databases (id) ON DELETE CASCADE,
+	container   TEXT NOT NULL,
+	host        TEXT NOT NULL DEFAULT '127.0.0.1',
+	port        INTEGER NOT NULL CHECK (port > 0 AND port < 65536),
+	created_at  TEXT NOT NULL
+);
 `
 
 // Store is a handle on the metadata database.
@@ -120,10 +174,30 @@ func (s *Store) migrate() error {
 		if _, err := s.db.Exec(schema); err != nil {
 			return fmt.Errorf("create schema: %w", err)
 		}
-		if _, err := s.db.Exec("PRAGMA user_version = 1"); err != nil {
+		if _, err := s.db.Exec("PRAGMA user_version = 3"); err != nil {
 			return fmt.Errorf("set schema version: %w", err)
 		}
-	case version > 1:
+	case version == 1:
+		// Version 2 adds SSH tunnel profiles, version 3 docker
+		// container profiles.
+		if _, err := s.db.Exec(sshTunnelsMigration); err != nil {
+			return fmt.Errorf("migrate to schema version 2: %w", err)
+		}
+		if _, err := s.db.Exec(dockerContainersMigration); err != nil {
+			return fmt.Errorf("migrate to schema version 3: %w", err)
+		}
+		if _, err := s.db.Exec("PRAGMA user_version = 3"); err != nil {
+			return fmt.Errorf("set schema version: %w", err)
+		}
+	case version == 2:
+		// Version 3 adds docker container profiles.
+		if _, err := s.db.Exec(dockerContainersMigration); err != nil {
+			return fmt.Errorf("migrate to schema version 3: %w", err)
+		}
+		if _, err := s.db.Exec("PRAGMA user_version = 3"); err != nil {
+			return fmt.Errorf("set schema version: %w", err)
+		}
+	case version > 3:
 		return fmt.Errorf(
 			"metadata schema version %d is newer than this pgvault build supports",
 			version,
@@ -158,6 +232,24 @@ func (s *Store) AddDatabase(name, connectionString string) (*Database, error) {
 	}
 
 	return database, nil
+}
+
+// DeleteDatabase removes a database and, through ON DELETE CASCADE,
+// its policy, tunnel profile and backup history. Stored backup objects
+// are not touched.
+func (s *Store) DeleteDatabase(id string) error {
+	result, err := s.db.Exec(`DELETE FROM databases WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete database: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("delete database: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("database %s: %w", id, ErrNotFound)
+	}
+	return nil
 }
 
 // GetDatabase returns the database registered under name.
@@ -250,6 +342,165 @@ func (s *Store) GetPolicy(databaseID string) (*Policy, error) {
 		return nil, fmt.Errorf("load backup policy: %w", err)
 	}
 	return &policy, nil
+}
+
+// UpsertTunnel creates or replaces the SSH tunnel profile of a
+// database. The profile is validated by the CHECK constraints on
+// ssh_tunnels: the port must be valid and the auth method known.
+func (s *Store) UpsertTunnel(tunnel Tunnel) error {
+	_, err := s.db.Exec(
+		`INSERT INTO ssh_tunnels
+			(database_id, host, port, user_name, auth_method, password,
+			 key_path, key_passphrase, known_hosts, insecure, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT (database_id) DO UPDATE SET
+			host = excluded.host,
+			port = excluded.port,
+			user_name = excluded.user_name,
+			auth_method = excluded.auth_method,
+			password = excluded.password,
+			key_path = excluded.key_path,
+			key_passphrase = excluded.key_passphrase,
+			known_hosts = excluded.known_hosts,
+			insecure = excluded.insecure,
+			created_at = excluded.created_at`,
+		tunnel.DatabaseID,
+		tunnel.Host,
+		tunnel.Port,
+		tunnel.User,
+		tunnel.AuthMethod,
+		tunnel.Password,
+		tunnel.KeyPath,
+		tunnel.KeyPassphrase,
+		tunnel.KnownHosts,
+		tunnel.Insecure,
+		formatTime(tunnel.CreatedAt),
+	)
+	if err != nil {
+		return fmt.Errorf("save ssh tunnel: %w", err)
+	}
+	return nil
+}
+
+// GetTunnel returns the SSH tunnel profile of a database, or (nil,
+// nil) if the database has none.
+func (s *Store) GetTunnel(databaseID string) (*Tunnel, error) {
+	row := s.db.QueryRow(
+		`SELECT database_id, host, port, user_name, auth_method, password,
+			key_path, key_passphrase, known_hosts, insecure, created_at
+		 FROM ssh_tunnels WHERE database_id = ?`,
+		databaseID,
+	)
+
+	var tunnel Tunnel
+	var createdAt string
+	err := row.Scan(
+		&tunnel.DatabaseID,
+		&tunnel.Host,
+		&tunnel.Port,
+		&tunnel.User,
+		&tunnel.AuthMethod,
+		&tunnel.Password,
+		&tunnel.KeyPath,
+		&tunnel.KeyPassphrase,
+		&tunnel.KnownHosts,
+		&tunnel.Insecure,
+		&createdAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load ssh tunnel: %w", err)
+	}
+	tunnel.CreatedAt = parseTime(createdAt)
+	return &tunnel, nil
+}
+
+// DeleteTunnel removes the SSH tunnel profile of a database. Deleting
+// a profile that does not exist is not an error.
+func (s *Store) DeleteTunnel(databaseID string) error {
+	if _, err := s.db.Exec(
+		`DELETE FROM ssh_tunnels WHERE database_id = ?`,
+		databaseID,
+	); err != nil {
+		return fmt.Errorf("delete ssh tunnel: %w", err)
+	}
+	return nil
+}
+
+// UpsertDocker creates or replaces the docker container profile of a
+// database.
+func (s *Store) UpsertDocker(container Docker) error {
+	if strings.TrimSpace(container.Container) == "" {
+		return errors.New("save docker container: container name is required")
+	}
+	if container.Port <= 0 || container.Port > 65535 {
+		return fmt.Errorf("save docker container: invalid port %d", container.Port)
+	}
+	if container.Host == "" {
+		container.Host = "127.0.0.1"
+	}
+
+	_, err := s.db.Exec(
+		`INSERT INTO docker_containers
+			(database_id, container, host, port, created_at)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT (database_id) DO UPDATE SET
+			container = excluded.container,
+			host = excluded.host,
+			port = excluded.port,
+			created_at = excluded.created_at`,
+		container.DatabaseID,
+		container.Container,
+		container.Host,
+		container.Port,
+		formatTime(container.CreatedAt),
+	)
+	if err != nil {
+		return fmt.Errorf("save docker container: %w", err)
+	}
+	return nil
+}
+
+// GetDocker returns the docker container profile of a database, or
+// (nil, nil) if the database has none.
+func (s *Store) GetDocker(databaseID string) (*Docker, error) {
+	row := s.db.QueryRow(
+		`SELECT database_id, container, host, port, created_at
+		 FROM docker_containers WHERE database_id = ?`,
+		databaseID,
+	)
+
+	var container Docker
+	var createdAt string
+	err := row.Scan(
+		&container.DatabaseID,
+		&container.Container,
+		&container.Host,
+		&container.Port,
+		&createdAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load docker container: %w", err)
+	}
+	container.CreatedAt = parseTime(createdAt)
+	return &container, nil
+}
+
+// DeleteDocker removes the docker container profile of a database.
+// Deleting a profile that does not exist is not an error.
+func (s *Store) DeleteDocker(databaseID string) error {
+	if _, err := s.db.Exec(
+		`DELETE FROM docker_containers WHERE database_id = ?`,
+		databaseID,
+	); err != nil {
+		return fmt.Errorf("delete docker container: %w", err)
+	}
+	return nil
 }
 
 // CreateBackup inserts a new backup record.

@@ -17,7 +17,9 @@ import (
 	"github.com/Dani-Bhai/pg-vault/internal/storage"
 )
 
-// Request describes one backup run.
+// Request describes one backup run. Dumper optionally overrides the
+// manager's default dump strategy, for example to run pg_dump inside a
+// docker container or on an ssh bastion.
 type Request struct {
 	DatabaseID     string
 	DatabaseName   string
@@ -28,6 +30,7 @@ type Request struct {
 	Keyring        encryption.Keyring
 	KeyVersion     int
 	Trigger        string
+	Dumper         postgres.Dumper
 }
 
 // Manager orchestrates a backup: pg_dump output is streamed through
@@ -35,11 +38,11 @@ type Request struct {
 // backend. No temporary files are involved, and the metadata database
 // records the lifecycle of every run.
 type Manager struct {
-	dumper *postgres.Dumper
+	dumper postgres.Dumper
 	store  *metadata.Store
 }
 
-func NewManager(dumper *postgres.Dumper, store *metadata.Store) *Manager {
+func NewManager(dumper postgres.Dumper, store *metadata.Store) *Manager {
 	return &Manager{
 		dumper: dumper,
 		store:  store,
@@ -154,7 +157,7 @@ func (m *Manager) stream(
 				return err
 			}
 
-			if err := m.dumper.Dump(ctx, req.DatabaseURL, archiveWriter); err != nil {
+			if err := m.effectiveDumper(req).Dump(ctx, req.DatabaseURL, archiveWriter); err != nil {
 				return err
 			}
 
@@ -189,6 +192,15 @@ func (m *Manager) stream(
 	result.Checksum = hex.EncodeToString(checksum.Sum(nil))
 
 	return nil
+}
+
+// effectiveDumper returns the dump strategy for a request, falling back
+// to the manager default.
+func (m *Manager) effectiveDumper(req Request) postgres.Dumper {
+	if req.Dumper != nil {
+		return req.Dumper
+	}
+	return m.dumper
 }
 
 // byteCounter counts the bytes streamed through it.
