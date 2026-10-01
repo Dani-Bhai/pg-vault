@@ -19,8 +19,8 @@ jobs:
           - { goos: darwin, goarch: amd64 }
           - { goos: darwin, goarch: arm64 }
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: Build
@@ -31,7 +31,7 @@ jobs:
         run: |
           go build -trimpath -ldflags "-s -w" -o pgvault ./cmd/pgvault
           tar -czf "pgvault_${GOOS}_${GOARCH}.tar.gz" pgvault
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: pgvault_${{ matrix.goos }}_${{ matrix.goarch }}
           path: pgvault_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz
@@ -40,7 +40,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -52,4 +52,4 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/checksums.txt --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/checksums.txt --generate-notes --repo "$GITHUB_REPOSITORY"
