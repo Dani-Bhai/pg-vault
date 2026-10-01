@@ -1,0 +1,6 @@
+# Built binary
+/pgvault
+/pgvault.exe
+
+# Release artifacts
+/dist/
